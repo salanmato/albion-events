@@ -2,52 +2,13 @@ import discord
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
-from flask import Flask
-from threading import Thread
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Olá, eu sou o seu gerenciador de eventos!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+import database # Importamos nosso novo módulo de banco de dados
 
 load_dotenv()
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv('TOKEN')
 
-# --- MUDANÇA 1: DE ROLES PARA TEMPLATES ---
-# Criamos um dicionário principal que guarda diferentes "moldes" de eventos.
-TEMPLATES = {
-    "raid": {
-        "nome_exibicao": "Raid (Padrão 5 Pessoas)",
-        "roles": {
-            "🛡️": {"nome": "Tanque", "limite": 1},
-            "➕": {"nome": "Healer", "limite": 1},
-            "⚔️": {"nome": "DPS",    "limite": 3},
-            "❓": {"nome": "Reserva", "limite": 5}
-        }
-    },
-    "dungeon": {
-        "nome_exibicao": "Dungeon (5 Pessoas)",
-        "roles": {
-            "🛡️": {"nome": "Tanque", "limite": 1},
-            "➕": {"nome": "Healer", "limite": 1},
-            "⚔️": {"nome": "DPS",    "limite": 3}
-            # Sem reserva neste template, por exemplo
-        }
-    }
-}
-
-# --- MUDANÇA 2: DICIONÁRIO PARA EVENTOS ATIVOS ---
-# O bot usará isso para "lembrar" qual template pertence a qual mensagem.
-# A chave será o ID da mensagem, o valor será o template usado.
-ACTIVE_EVENTS = {}
+# Os dicionários TEMPLATES e ACTIVE_EVENTS foram removidos.
+# Toda a lógica agora vem do banco de dados.
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -57,18 +18,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    # Inicializa o banco de dados (cria as tabelas se não existirem) quando o bot liga
+    database.init_db()
     print(f'Bot conectado como {bot.user}')
 
-# --- MUDANÇA 3: NOVO COMANDO DE EVENTO BASEADO EM TEMPLATE ---
 @bot.command(name="evento")
 async def criar_evento(ctx, template_nome: str, titulo: str, data_hora: str, *, descricao: str):
     template_nome = template_nome.lower()
-    if template_nome not in TEMPLATES:
-        await ctx.send(f"Erro: Template `{template_nome}` não encontrado. Tente: `{', '.join(TEMPLATES.keys())}`")
+    
+    # Busca os templates disponíveis do banco de dados
+    available_templates = database.get_all_template_names()
+    if template_nome not in available_templates:
+        await ctx.send(f"Erro: Template `{template_nome}` não encontrado. Tente: `{', '.join(available_templates)}`")
         return
 
-    template_selecionado = TEMPLATES[template_nome]
-    roles_do_template = template_selecionado["roles"]
+    # Busca as roles do template específico do banco de dados
+    roles_do_template = database.get_template_roles(template_nome)
 
     embed = discord.Embed(
         title=f"📅 Evento: {titulo}",
@@ -80,32 +45,36 @@ async def criar_evento(ctx, template_nome: str, titulo: str, data_hora: str, *, 
         color=discord.Color.dark_gold()
     )
     
-    for emoji, info_role in roles_do_template.items():
-        nome_funcao = info_role["nome"]
-        limite = info_role["limite"]
-        embed.add_field(name=f"{emoji} {nome_funcao} (0/{limite})", value="Ninguém inscrito.", inline=False)
+    emojis_para_reagir = []
+    for role in roles_do_template:
+        embed.add_field(name=f"{role['emoji']} {role['role_name']} (0/{role['role_limit']})", value="Ninguém inscrito.", inline=False)
+        emojis_para_reagir.append(role['emoji'])
     
-    embed.set_footer(text=f"Evento criado com o template: {template_selecionado['nome_exibicao']}")
+    embed.set_footer(text=f"Evento criado com o template: {template_nome}")
     mensagem_do_evento = await ctx.send(embed=embed)
 
-    # Associa a mensagem ao template no nosso "banco de dados" em memória
-    ACTIVE_EVENTS[mensagem_do_evento.id] = template_selecionado
+    # Salva o evento no banco de dados para que o bot "lembre" dele
+    database.add_active_event(mensagem_do_evento.id, ctx.channel.id, ctx.guild.id, template_nome)
 
-    for emoji in roles_do_template.keys():
+    for emoji in emojis_para_reagir:
         await mensagem_do_evento.add_reaction(emoji)
-
-# --- MUDANÇA 4: ATUALIZAR OS "OUVINTES" PARA USAR OS TEMPLATES ---
-# Todas as funções abaixo agora consultam ACTIVE_EVENTS para saber as regras do evento específico.
 
 @bot.event
 async def on_raw_reaction_add(payload):
-    if payload.user_id == bot.user.id or payload.message_id not in ACTIVE_EVENTS:
+    if payload.user_id == bot.user.id:
         return
     
-    template_do_evento = ACTIVE_EVENTS[payload.message_id]
-    roles_do_template = template_do_evento["roles"]
+    # Verifica se a mensagem é um evento ativo buscando no DB
+    event_details = database.get_event_details(payload.message_id)
+    if not event_details:
+        return
+    
+    template_name = event_details['template_name']
+    roles_do_template_raw = database.get_template_roles(template_name)
+    # Converte a lista de roles para um dicionário para facilitar o acesso
+    roles_do_template = {role['emoji']: {'nome': role['role_name'], 'limite': role['role_limit']} for role in roles_do_template_raw}
+    
     emoji_str = str(payload.emoji)
-
     if emoji_str in roles_do_template:
         guild = await bot.fetch_guild(payload.guild_id)
         member = await guild.fetch_member(payload.user_id)
@@ -134,11 +103,16 @@ async def on_raw_reaction_add(payload):
 
 @bot.event
 async def on_raw_reaction_remove(payload):
-    if payload.user_id == bot.user.id or payload.message_id not in ACTIVE_EVENTS:
+    if payload.user_id == bot.user.id:
         return
 
-    template_do_evento = ACTIVE_EVENTS[payload.message_id]
-    roles_do_template = template_do_evento["roles"]
+    event_details = database.get_event_details(payload.message_id)
+    if not event_details:
+        return
+    
+    template_name = event_details['template_name']
+    roles_do_template_raw = database.get_template_roles(template_name)
+    roles_do_template = {role['emoji']: {'nome': role['role_name'], 'limite': role['role_limit']} for role in roles_do_template_raw}
 
     if str(payload.emoji) in roles_do_template:
         channel = await bot.fetch_channel(payload.channel_id)
@@ -147,11 +121,13 @@ async def on_raw_reaction_remove(payload):
             await atualizar_inscritos(message)
 
 async def atualizar_inscritos(message):
-    if message.id not in ACTIVE_EVENTS:
+    event_details = database.get_event_details(message.id)
+    if not event_details:
         return
-
-    template_do_evento = ACTIVE_EVENTS[message.id]
-    roles_do_template = template_do_evento["roles"]
+    
+    template_name = event_details['template_name']
+    roles_do_template_raw = database.get_template_roles(template_name)
+    roles_do_template = {role['emoji']: {'nome': role['role_name'], 'limite': role['role_limit']} for role in roles_do_template_raw}
     
     embed_antigo = message.embeds[0]
     novo_embed = discord.Embed.from_dict(embed_antigo.to_dict())
@@ -175,5 +151,4 @@ async def atualizar_inscritos(message):
     
     await message.edit(embed=novo_embed)
 
-keep_alive()
 bot.run(TOKEN)
