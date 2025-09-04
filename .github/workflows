@@ -1,0 +1,13 @@
+name: Ping Replit Bot
+
+on:
+  schedule:
+    # Executa a cada 20 minutos
+    - cron: '*/20 * * * *'
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send request to Replit URL
+        run: curl "https://66bf6e33-a175-46ab-b66b-1224922b80f3-00-31rjfn7iorusa.worf.replit.dev/ping"
